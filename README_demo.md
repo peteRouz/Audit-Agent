@@ -1,0 +1,1 @@
+Demo pronta. Corre `streamlit run app.py`.
