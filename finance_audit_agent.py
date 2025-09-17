@@ -63,7 +63,7 @@ COL_TT          = "TT"              # transaction type (IO/GL/PB/...)
 COL_TRANS_NO    = "TransNo"
 COL_TRANS_DATE  = "Trans date"
 COL_PERIOD      = "Period"
-COL_HDL_ACC     = "Hdl.acc"
+COL_HD_ACC     = "Hd.acc"
 COL_ACC_DESC    = "Acc"             # account description/name
 COL_ACC_CODE    = "Acc(T)"          # account code
 COL_CAT1        = "Cat1"
@@ -135,7 +135,7 @@ class FinanceAuditAgent:
 
         expected = [
             COL_ENTITY, COL_TT, COL_TRANS_NO, COL_TRANS_DATE, COL_PERIOD,
-            COL_HDL_ACC, COL_ACC_DESC, COL_ACC_CODE,
+            COL_HD_ACC, COL_ACC_DESC, COL_ACC_CODE,
             COL_CAT1, COL_CAT2, COL_CAT3, COL_CAT4, COL_CAT5, COL_CAT6, COL_CAT7,
             COL_SUPPLIER_ID, COL_SUPPLIER_NM,
             COL_INV_NO, COL_TC, COL_TS, COL_CUR, COL_CUR_AMT, COL_AMT_EUR, COL_TEXT
