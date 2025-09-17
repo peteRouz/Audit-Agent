@@ -90,12 +90,12 @@ class FinanceAuditAgent:
             df["Trans dat"] = pd.to_datetime(df["Trans dat"], errors="coerce")
 
         # Filter by allowed TTs and period range
-        if "T" in df.columns:
-            df["T"] = df["T"].astype(str).str.upper()
+        if "TT" in df.columns:
+            df["T"] = df["TT"].astype(str).str.upper()
 
         allowed = set(x.upper() for x in (self.allowed_tt or []))
         if allowed:
-            df = df[df["T"].isin(allowed) | df["T"].eq("IO")]  # always keep IO
+            df = df[df["TT"].isin(allowed) | df["TT"].eq("IO")]  # always keep IO
 
         if "Perioc" in df.columns:
             df = df[(df["Perioc"] >= int(self.period_min)) & (df["Perioc"] <= int(self.period_max))]
