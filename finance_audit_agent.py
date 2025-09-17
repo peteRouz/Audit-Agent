@@ -13,11 +13,23 @@ import pandas as pd
 # =============================== Utils =================================
 
 def _norm_str(x) -> str:
+    """Normalize a single string (for comparisons)."""
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return ""
-    s = str(x).strip().lower()
+    s = str(x).replace("\n", " ").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
+
+def _norm_series(s: pd.Series) -> pd.Series:
+    """Normalize a pandas Series of strings safely."""
+    return (
+        s.fillna("")
+         .astype(str)
+         .str.replace("\n", " ", regex=False)
+         .str.strip()
+         .str.lower()
+         .str.replace(r"\s+", " ", regex=True)
+    )
 
 def _approx_equal(a: float, b: float, tol: float = 0.02) -> bool:
     try:
@@ -44,21 +56,32 @@ def _to_date(obj, fallback=None):
 
 # =========================== Column constants ==========================
 
-# EXACT headers from your sheet
-COL_TT          = "TT"
+# EXACT headers from your sheet (per the last screenshots)
+COL_ENTITY      = "Entity"
+COL_TT          = "TT"              # transaction type (IO/GL/PB/...)
 COL_TRANS_NO    = "TransNo"
 COL_TRANS_DATE  = "Trans date"
 COL_PERIOD      = "Period"
-COL_HD_ACC     = "Hd.acc"
-COL_ACC_DESC    = "Acc"        # account description/name
-COL_ACC_CODE    = "Acc(T)"     # account code
+COL_HDL_ACC     = "Hdl.acc"
+COL_ACC_DESC    = "Acc"             # account description/name
+COL_ACC_CODE    = "Acc(T)"          # account code
+COL_CAT1        = "Cat1"
+COL_CAT2        = "Cat2"
+COL_CAT3        = "Cat3"
+COL_CAT4        = "Cat4"
+COL_CAT5        = "Cat5"
+COL_CAT6        = "Cat6"
+COL_CAT7        = "Cat7"
 COL_SUPPLIER_ID = "Ap/Ar ID"
 COL_SUPPLIER_NM = "Ap/Ar ID(T)"
 COL_INV_NO      = "Inv No"
+COL_TC          = "TC"
+COL_TS          = "TS"
 COL_CUR         = "Cur"
-COL_CUR_AMT     = "Cur. amount"
-COL_AMT_EUR     = "Amount"
+COL_CUR_AMT     = "Cur. amount"     # amount in trans currency
+COL_AMT_EUR     = "Amount"          # amount in EUR / local
 COL_TEXT        = "Text"
+
 
 # ============================== Agent ==================================
 
@@ -73,7 +96,7 @@ class FinanceAuditAgent:
     period_min: int
     period_max: int
     # Windows
-    date_window_days: int = 14          # UI simple slider (kept)
+    date_window_days: int = 14          # (kept for UI simple slider)
     date_window_days_gl: int = 90       # GL payment window (± days)
     date_window_days_bank: int = 90     # MT940 window (± days)
 
@@ -95,19 +118,22 @@ class FinanceAuditAgent:
         except Exception as e:
             raise RuntimeError(f"Failed to read ERP Excel: {e}")
 
-        # Normalize headers (trim/replace newlines) but KEEP your names
+        # Normalize headers (strip/newlines/extra spaces)
         def _clean_col(c):
             c = str(c).replace("\n", " ").strip()
             c = re.sub(r"\s+", " ", c)
+            # normalize some unicode punctuation to ascii if present
+            c = c.replace("’", "'").replace("–", "-").replace("—", "-")
             return c
 
         df.columns = [_clean_col(c) for c in df.columns]
 
         expected = [
-            COL_TT, COL_TRANS_NO, COL_TRANS_DATE, COL_PERIOD,
-            COL_HD_ACC, COL_ACC_DESC, COL_ACC_CODE,
+            COL_ENTITY, COL_TT, COL_TRANS_NO, COL_TRANS_DATE, COL_PERIOD,
+            COL_HDL_ACC, COL_ACC_DESC, COL_ACC_CODE,
+            COL_CAT1, COL_CAT2, COL_CAT3, COL_CAT4, COL_CAT5, COL_CAT6, COL_CAT7,
             COL_SUPPLIER_ID, COL_SUPPLIER_NM,
-            COL_INV_NO, COL_CUR, COL_CUR_AMT, COL_AMT_EUR, COL_TEXT
+            COL_INV_NO, COL_TC, COL_TS, COL_CUR, COL_CUR_AMT, COL_AMT_EUR, COL_TEXT
         ]
         missing = [c for c in expected if c not in df.columns]
         if missing:
@@ -231,8 +257,8 @@ class FinanceAuditAgent:
         if block.empty:
             return {"code": None, "desc": None}
 
-        desc_ser = _norm_str(block.get(COL_ACC_DESC)) if COL_ACC_DESC in block.columns else pd.Series("", index=block.index)
-        text_ser = _norm_str(block.get(COL_TEXT)) if COL_TEXT in block.columns else pd.Series("", index=block.index)
+        desc_ser = _norm_series(block[COL_ACC_DESC]) if COL_ACC_DESC in block.columns else pd.Series("", index=block.index)
+        text_ser = _norm_series(block[COL_TEXT]) if COL_TEXT in block.columns else pd.Series("", index=block.index)
         has_tp = desc_ser.str.contains("trade payables", na=False) | text_ser.str.contains("trade payables", na=False)
 
         cand = block[has_tp]
@@ -255,15 +281,15 @@ class FinanceAuditAgent:
 
         # GL only in window
         df = df[(df[COL_TT] == "GL")]
-        df = df[(pd.to_datetime(df[COL_TRANS_DATE], errors="coerce") >= date_min) &
-                (pd.to_datetime(df[COL_TRANS_DATE], errors="coerce") <= date_max)]
+        df_dates = pd.to_datetime(df[COL_TRANS_DATE], errors="coerce")
+        df = df[(df_dates >= date_min) & (df_dates <= date_max)]
 
         # supplier match
         io_sup_id = _norm_str(io_row.get(COL_SUPPLIER_ID, ""))
         io_sup_nm = _norm_str(io_row.get(COL_SUPPLIER_NM, ""))
 
-        df["_sup_id"] = df[COL_SUPPLIER_ID].apply(_norm_str)
-        df["_sup_nm"] = df[COL_SUPPLIER_NM].apply(_norm_str)
+        df["_sup_id"] = _norm_series(df[COL_SUPPLIER_ID])
+        df["_sup_nm"] = _norm_series(df[COL_SUPPLIER_NM])
         df = df[(df["_sup_id"] == io_sup_id) | (df["_sup_nm"] == io_sup_nm)]
 
         if df.empty:
@@ -279,7 +305,7 @@ class FinanceAuditAgent:
             g = g.copy()
 
             is_code = g[COL_ACC_CODE].astype(str).str.strip().eq(ap_code) if ap_code else False
-            is_desc = _norm_str(g[COL_ACC_DESC]).str.contains(re.escape(ap_desc_norm), na=False) if ap_desc_norm else False
+            is_desc = _norm_series(g[COL_ACC_DESC]).str.contains(re.escape(ap_desc_norm), na=False) if ap_desc_norm else False
             ap_mask = is_code | is_desc
 
             # debit on AP (EUR > 0)
@@ -287,8 +313,13 @@ class FinanceAuditAgent:
             ap_debit_eur = _safe_float(g_ap[COL_AMT_EUR].sum())
             ap_debit_cur = _safe_float(g_ap[COL_CUR_AMT].sum())
 
-            bank_like = _norm_str(g[COL_ACC_DESC]).str.contains("bank|iban|clearing|ing|santander|hsbc|unicredit", na=False) | \
-                        _norm_str(g.get(COL_TEXT, "")).str.contains("bank|iban|clearing|ing|santander|hsbc|unicredit", na=False)
+            bank_like = _norm_series(g[COL_ACC_DESC]).str.contains(
+                "bank|iban|clearing|ing|santander|hsbc|unicredit", na=False
+            )
+            if COL_TEXT in g.columns:
+                bank_like = bank_like | _norm_series(g[COL_TEXT]).str.contains(
+                    "bank|iban|clearing|ing|santander|hsbc|unicredit", na=False
+                )
 
             score = 0.0
             if _approx_equal(ap_debit_eur, io_amt_eur, 0.05):
@@ -447,7 +478,7 @@ class FinanceAuditAgent:
                     "amount_eur": r.get(COL_AMT_EUR, ""),
                 })
 
-        # Narrative
+        # Narrative (EN)
         parts = []
         if post_date:
             parts.append(
