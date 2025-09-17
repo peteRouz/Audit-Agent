@@ -56,7 +56,7 @@ def _to_date(obj, fallback=None):
 
 # =========================== Column constants ==========================
 
-# EXACT headers from your sheet (per the last screenshots)
+# EXACT headers from your sheet
 COL_ENTITY      = "Entity"
 COL_TT          = "TT"              # transaction type (IO/GL/PB/...)
 COL_TRANS_NO    = "TransNo"
@@ -122,7 +122,6 @@ class FinanceAuditAgent:
         def _clean_col(c):
             c = str(c).replace("\n", " ").strip()
             c = re.sub(r"\s+", " ", c)
-            # normalize some unicode punctuation to ascii if present
             c = c.replace("’", "'").replace("–", "-").replace("—", "-")
             return c
 
@@ -275,16 +274,13 @@ class FinanceAuditAgent:
     def _find_gl_payment(self, io_row: pd.Series, ap_account: Dict) -> Optional[Dict]:
         df = self.erp_df.copy()
 
+        # Use pandas Timestamps for window to avoid dtype mismatches
         io_date = _to_date(io_row.get(COL_TRANS_DATE), fallback=datetime.today().date())
-        
-        # usa pandas.Timestamp para a janela
         date_min_ts = pd.Timestamp(io_date) - pd.Timedelta(days=self.date_window_days_gl)
         date_max_ts = pd.Timestamp(io_date) + pd.Timedelta(days=self.date_window_days_gl)
 
         # GL only in window
-        df = self.erp_df.copy()
         df = df[(df[COL_TT] == "GL")]
-
         df_dates = pd.to_datetime(df[COL_TRANS_DATE], errors="coerce")
         df = df[(df_dates >= date_min_ts) & (df_dates <= date_max_ts)]
 
@@ -334,7 +330,7 @@ class FinanceAuditAgent:
                 score += 1.0
 
             gl_date = _to_date(g.iloc[0].get(COL_TRANS_DATE), fallback=io_date)
-            days = abs((gl_date - io_date).days)
+            days = abs((pd.Timestamp(gl_date) - pd.Timestamp(io_date)).days)
             score += max(0, 1.0 - (days / 90.0))
 
             groups.append({
@@ -356,26 +352,29 @@ class FinanceAuditAgent:
         return best
 
     # --------------------------- MT940 match ---------------------------
+    # >>> Amount must match (within tolerance) <<<
+
     def _match_mt940(self, gl_best: Optional[Dict], io_row: pd.Series) -> List[Dict]:
         """Match bank entries ONLY if the amount matches (within tolerance)."""
         if not self.mt940_index:
             return []
 
-        # base date: prefer GL date (pagamento), fallback IO
+        # base date: prefer GL date (payment), fallback IO
         base_date = (gl_best.get("gl_date") if (gl_best and gl_best.get("gl_date"))
                      else _to_date(io_row.get(COL_TRANS_DATE), fallback=datetime.today().date()))
         w = int(self.date_window_days_bank or 10)
         dmin = base_date - timedelta(days=w)
         dmax = base_date + timedelta(days=w)
 
-        # alvo = débito AP do GL (EUR); fallback = montante EUR da IO
+        # target = AP debit in GL (EUR); fallback = IO EUR amount
         target_amt = abs(_safe_float(io_row.get(COL_AMT_EUR, 0.0)))
         if gl_best and _safe_float(gl_best.get("ap_debit_eur", 0.0)) > 0:
             target_amt = abs(_safe_float(gl_best.get("ap_debit_eur", 0.0)))
 
-        # tolerâncias (ajusta se quiseres): máx(1.00 EUR, 0.5%)
+        # tolerances: max(1.00 EUR, 0.5%)
         tol_abs = 1.00
         tol_rel = 0.005
+
         def amt_ok(a, b):
             return abs(a - b) <= max(tol_abs, tol_rel * max(b, 1.0))
 
@@ -389,19 +388,18 @@ class FinanceAuditAgent:
                 continue
 
             amt = abs(_safe_float(row.get("amount", 0.0)))
-            # 🚫 Exigir montante a bater — senão ignora logo
+            # Require amount to match
             if not amt_ok(amt, target_amt):
                 continue
 
-            # scoring por pistas extra (tudo opcional, mas nunca sem amount)
-            score = 2.5  # base por bater montante
+            score = 2.5  # base for amount match
             ref = _norm_str(row.get("ref", ""))
 
             if inv and inv in ref:
                 score += 1.0
             if sup:
-                # só palavras >2 chars para evitar ruído
-                if any(w for w in sup.split() if w in ref and len(w) > 2):
+                toks = [w for w in sup.split() if len(w) > 2]
+                if any(w in ref for w in toks):
                     score += 0.5
 
             acc = row.get("account") or ""
@@ -524,7 +522,7 @@ class FinanceAuditAgent:
             status = "ERP payment (GL) not found"
             parts.append("No GL transaction found debiting the same trade payables account for the invoice amount.")
 
-        # MT940 (best candidate)
+        # MT940 (best candidate with amount match)
         bank_rows = []
         mt_candidates = self._match_mt940(gl_best, io)
         if mt_candidates:
