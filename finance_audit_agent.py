@@ -356,53 +356,69 @@ class FinanceAuditAgent:
         return best
 
     # --------------------------- MT940 match ---------------------------
-
     def _match_mt940(self, gl_best: Optional[Dict], io_row: pd.Series) -> List[Dict]:
-        if not self.mt940_index:
-            return []
+    """Match bank entries ONLY if the amount matches (within tolerance)."""
+    if not self.mt940_index:
+        return []
 
-        base_date = (gl_best.get("gl_date") if (gl_best and gl_best.get("gl_date"))
-                     else _to_date(io_row.get(COL_TRANS_DATE), fallback=datetime.today().date()))
-        w = int(self.date_window_days_bank or 10)
-        dmin = base_date - timedelta(days=w)
-        dmax = base_date + timedelta(days=w)
+    # base date: prefer GL date (pagamento), fallback IO
+    base_date = (gl_best.get("gl_date") if (gl_best and gl_best.get("gl_date"))
+                 else _to_date(io_row.get(COL_TRANS_DATE), fallback=datetime.today().date()))
+    w = int(self.date_window_days_bank or 10)
+    dmin = base_date - timedelta(days=w)
+    dmax = base_date + timedelta(days=w)
 
-        target_amt = abs(_safe_float(io_row.get(COL_AMT_EUR, 0.0)))
-        if gl_best and _safe_float(gl_best.get("ap_debit_eur", 0.0)) > 0:
-            target_amt = abs(_safe_float(gl_best.get("ap_debit_eur", 0.0)))
+    # alvo = débito AP do GL (EUR); fallback = montante EUR da IO
+    target_amt = abs(_safe_float(io_row.get(COL_AMT_EUR, 0.0)))
+    if gl_best and _safe_float(gl_best.get("ap_debit_eur", 0.0)) > 0:
+        target_amt = abs(_safe_float(gl_best.get("ap_debit_eur", 0.0)))
 
-        inv = _norm_str(io_row.get(COL_INV_NO, ""))
-        sup = _norm_str(io_row.get(COL_SUPPLIER_NM, ""))
+    # tolerâncias (ajusta se quiseres): máx(1.00 EUR, 0.5%)
+    tol_abs = 1.00
+    tol_rel = 0.005
+    def amt_ok(a, b):
+        return abs(a - b) <= max(tol_abs, tol_rel * max(b, 1.0))
 
-        candidates = []
-        for row in self.mt940_index:
-            dt = row.get("date")
-            if not dt or not (dmin <= dt <= dmax):
-                continue
-            amt = abs(_safe_float(row.get("amount", 0.0)))
+    inv = _norm_str(io_row.get(COL_INV_NO, ""))
+    sup = _norm_str(io_row.get(COL_SUPPLIER_NM, ""))
 
-            score = 0.0
-            if _approx_equal(amt, target_amt, 0.05):
-                score += 3.5
-            ref = _norm_str(row.get("ref", ""))
-            if inv and inv in ref:
-                score += 1.0
-            if sup and any(w in ref for w in sup.split()):
+    candidates = []
+    for row in self.mt940_index:
+        dt = row.get("date")
+        if not dt or not (dmin <= dt <= dmax):
+            continue
+
+        amt = abs(_safe_float(row.get("amount", 0.0)))
+        # 🚫 Exigir montante a bater — senão ignora logo
+        if not amt_ok(amt, target_amt):
+            continue
+
+        # scoring por pistas extra (tudo opcional, mas nunca sem amount)
+        score = 2.5  # base por bater montante
+        ref = _norm_str(row.get("ref", ""))
+
+        if inv and inv in ref:
+            score += 1.0
+        if sup:
+            # só palavras >2 chars para evitar ruído
+            if any(w for w in sup.split() if w in ref and len(w) > 2):
                 score += 0.5
-            if self.bank_account_suffix and str(self.bank_account_suffix) in (row.get("account") or ""):
-                score += 0.5
 
-            candidates.append({
-                "date": row.get("date"),
-                "amount": row.get("amount"),
-                "reference": row.get("ref"),
-                "file": row.get("file"),
-                "account": row.get("account"),
-                "score": score
-            })
+        acc = row.get("account") or ""
+        if self.bank_account_suffix and str(self.bank_account_suffix) in acc:
+            score += 0.5
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        return candidates[:3]
+        candidates.append({
+            "date": row.get("date"),
+            "amount": row.get("amount"),
+            "reference": row.get("ref"),
+            "file": row.get("file"),
+            "account": acc,
+            "score": score
+        })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:3]
 
     # ------------------------ Invoice PDF ------------------------------
 
