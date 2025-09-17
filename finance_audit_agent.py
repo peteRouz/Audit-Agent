@@ -276,13 +276,17 @@ class FinanceAuditAgent:
         df = self.erp_df.copy()
 
         io_date = _to_date(io_row.get(COL_TRANS_DATE), fallback=datetime.today().date())
-        date_min = io_date - pd.Timedelta(days=self.date_window_days_gl)
-        date_max = io_date + pd.Timedelta(days=self.date_window_days_gl)
+        
+        # usa pandas.Timestamp para a janela
+        date_min_ts = pd.Timestamp(io_date) - pd.Timedelta(days=self.date_window_days_gl)
+        date_max_ts = pd.Timestamp(io_date) + pd.Timedelta(days=self.date_window_days_gl)
 
         # GL only in window
+        df = self.erp_df.copy()
         df = df[(df[COL_TT] == "GL")]
+
         df_dates = pd.to_datetime(df[COL_TRANS_DATE], errors="coerce")
-        df = df[(df_dates >= date_min) & (df_dates <= date_max)]
+        df = df[(df_dates >= date_min_ts) & (df_dates <= date_max_ts)]
 
         # supplier match
         io_sup_id = _norm_str(io_row.get(COL_SUPPLIER_ID, ""))
