@@ -68,12 +68,11 @@ class FinanceAuditAgent:
 
         # Normalize expected columns (keep original headers as in your file)
         expected = [
-            "Entity", "TT", "TransNo", "Trans dat", "Perioc",
-            "Hdl.acc", "Acc(T)", "Acc(I)",
+            "Entity", "TT", "TransNo", "Trans date", "Period",
+            "Acc", "Acc(T)",
             "Cat1", "Cat2", "Cat3", "Cat4", "Cat5",
-            "Ca", "CaV",
-            "Ap/Ar I", "Ap/Ar ID(T)",
-            "Inv N",
+            "Ap/Ar ID", "Ap/Ar ID(T)",
+            "Inv No",
             "Cur", "Cur. amount", "Amount"
         ]
         missing = [c for c in expected if c not in df.columns]
