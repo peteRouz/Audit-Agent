@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 import pandas as pd
 
@@ -62,7 +63,7 @@ COL_TT          = "TT"              # transaction type (IO/GL/PB/...)
 COL_TRANS_NO    = "TransNo"
 COL_TRANS_DATE  = "Trans date"
 COL_PERIOD      = "Period"
-COL_HD_ACC     = "Hd.acc"
+COL_HDL_ACC     = "Hdl.acc"
 COL_ACC_DESC    = "Acc"             # account description/name
 COL_ACC_CODE    = "Acc(T)"          # account code
 COL_CAT1        = "Cat1"
@@ -95,10 +96,12 @@ class FinanceAuditAgent:
     allowed_tt: List[str]
     period_min: int
     period_max: int
+    # Email (optional, for the mailto button)
+    bankdesk_email: str = ""          # e.g., "bankdesk@yourcompany.com"
     # Windows
-    date_window_days: int = 14          # (kept for UI simple slider)
-    date_window_days_gl: int = 90       # GL payment window (± days)
-    date_window_days_bank: int = 90     # MT940 window (± days)
+    date_window_days: int = 14        # (kept for UI simple slider)
+    date_window_days_gl: int = 90     # GL payment window (± days)
+    date_window_days_bank: int = 90   # MT940 window (± days)
 
     # runtime
     erp_df: pd.DataFrame | None = None
@@ -113,6 +116,8 @@ class FinanceAuditAgent:
     def _load_erp(self):
         try:
             df = pd.read_excel(self.excel_path, sheet_name=self.sheet_name, engine="openpyxl")
+            # second pass to capture raw text exactly as Excel yields to pandas
+            df_raw = pd.read_excel(self.excel_path, sheet_name=self.sheet_name, engine="openpyxl", dtype=str)
         except ImportError:
             raise ImportError("Missing dependency 'openpyxl'. Please add 'openpyxl' to requirements.")
         except Exception as e:
@@ -126,10 +131,11 @@ class FinanceAuditAgent:
             return c
 
         df.columns = [_clean_col(c) for c in df.columns]
+        df_raw.columns = [_clean_col(c) for c in df_raw.columns]
 
         expected = [
             COL_ENTITY, COL_TT, COL_TRANS_NO, COL_TRANS_DATE, COL_PERIOD,
-            COL_HD_ACC, COL_ACC_DESC, COL_ACC_CODE,
+            COL_HDL_ACC, COL_ACC_DESC, COL_ACC_CODE,
             COL_CAT1, COL_CAT2, COL_CAT3, COL_CAT4, COL_CAT5, COL_CAT6, COL_CAT7,
             COL_SUPPLIER_ID, COL_SUPPLIER_NM,
             COL_INV_NO, COL_TC, COL_TS, COL_CUR, COL_CUR_AMT, COL_AMT_EUR, COL_TEXT
@@ -144,6 +150,17 @@ class FinanceAuditAgent:
 
         df[COL_TRANS_DATE] = pd.to_datetime(df[COL_TRANS_DATE], errors="coerce")
         df[COL_TT] = df[COL_TT].astype(str).str.upper()
+
+        # Attach raw strings exactly as read (no numeric coercion / no formatting)
+        if COL_CUR_AMT in df_raw.columns:
+            df["_raw_cur_amount"] = df_raw[COL_CUR_AMT].astype(str)
+        else:
+            df["_raw_cur_amount"] = df[COL_CUR_AMT].astype(str)
+
+        if COL_AMT_EUR in df_raw.columns:
+            df["_raw_amount_eur"] = df_raw[COL_AMT_EUR].astype(str)
+        else:
+            df["_raw_amount_eur"] = df[COL_AMT_EUR].astype(str)
 
         # Filter by TT (keep IO always)
         allowed = set(x.upper() for x in (self.allowed_tt or []))
@@ -431,6 +448,45 @@ class FinanceAuditAgent:
                 return str(f)
         return None
 
+    # ------------------------ Bank email (mailto) ----------------------
+
+    def _build_bank_mailto(self, io_row: pd.Series, gl_best: Optional[Dict], mt_best: Optional[Dict]) -> Optional[str]:
+        if not self.bankdesk_email:
+            return None
+
+        sup = str(io_row.get(COL_SUPPLIER_NM, "")).strip()
+        inv = str(io_row.get(COL_INV_NO, "")).strip()
+        amt_eur = abs(_safe_float(io_row.get(COL_AMT_EUR, 0.0)))
+        io_no = str(io_row.get(COL_TRANS_NO))
+        gl_no = str(gl_best["gl_trans_no"]) if gl_best else "-"
+        gl_date = gl_best["gl_date"] if gl_best else "-"
+        acc_suffix = self.bank_account_suffix or "-"
+        ref = (mt_best or {}).get("reference", "")
+
+        subject = f"Bank confirmation request – Inv {inv} – {sup} – {amt_eur:,.2f} EUR"
+        body_lines = [
+            "Hello Bankdesk,",
+            "",
+            "Please confirm the payment below on the bank statement.",
+            "",
+            f"Supplier: {sup}",
+            f"Invoice: {inv}",
+            f"ERP IO (invoice) TransNo: {io_no}",
+            f"ERP GL (payment) TransNo: {gl_no}  |  Date: {gl_date}",
+            f"Expected amount (EUR): {amt_eur:,.2f}",
+            f"Bank account (last 4): {acc_suffix}",
+        ]
+        if ref:
+            body_lines += [f"Candidate bank reference: {ref[:300]}"]
+        body_lines += ["", "Thanks."]
+
+        mailto = (
+            f"mailto:{quote(self.bankdesk_email)}"
+            f"?subject={quote(subject)}"
+            f"&body={quote('\n'.join(body_lines))}"
+        )
+        return mailto
+
     # ---------------------------- Public API ---------------------------
 
     def explain_from_io(self, io_trans_no: int) -> Dict:
@@ -462,7 +518,7 @@ class FinanceAuditAgent:
         # find GL
         gl_best = self._find_gl_payment(io, ap_acc)
 
-        # ERP tables
+        # ERP tables (show RAW values from Excel for amounts)
         table_erp: List[Dict] = []
         for _, r in io_block.iterrows():
             table_erp.append({
@@ -475,8 +531,8 @@ class FinanceAuditAgent:
                 "supplier": str(r.get(COL_SUPPLIER_NM, "")),
                 "invoice": str(r.get(COL_INV_NO, "")),
                 "cur": str(r.get(COL_CUR, "")),
-                "curr_amount": r.get(COL_CUR_AMT, ""),
-                "amount_eur": r.get(COL_AMT_EUR, ""),
+                "curr_amount": r.get("_raw_cur_amount", ""),
+                "amount_eur": r.get("_raw_amount_eur", ""),
             })
 
         if gl_best:
@@ -492,8 +548,8 @@ class FinanceAuditAgent:
                     "supplier": str(r.get(COL_SUPPLIER_NM, "")),
                     "invoice": str(r.get(COL_INV_NO, "")),
                     "cur": str(r.get(COL_CUR, "")),
-                    "curr_amount": r.get(COL_CUR_AMT, ""),
-                    "amount_eur": r.get(COL_AMT_EUR, ""),
+                    "curr_amount": r.get("_raw_cur_amount", ""),
+                    "amount_eur": r.get("_raw_amount_eur", ""),
                 })
 
         # Narrative (EN)
@@ -525,20 +581,23 @@ class FinanceAuditAgent:
         # MT940 (best candidate with amount match)
         bank_rows = []
         mt_candidates = self._match_mt940(gl_best, io)
-        if mt_candidates:
-            best = mt_candidates[0]
+        mt_best = mt_candidates[0] if mt_candidates else None
+        if mt_best:
             bank_rows.append({
-                "date": str(best["date"]),
-                "amount": best["amount"],
-                "reference": best["reference"],
-                "file": best["file"],
-                "account": best.get("account") or f"...{self.bank_account_suffix}",
-                "score": round(best["score"], 2),
+                "date": str(mt_best["date"]),
+                "amount": mt_best["amount"],
+                "reference": mt_best["reference"],
+                "file": mt_best["file"],
+                "account": mt_best.get("account") or f"...{self.bank_account_suffix}",
+                "score": round(mt_best["score"], 2),
             })
             parts.append(
-                f"Bank statement {best['file']} on {best['date']} shows {abs(_safe_float(best['amount'])):,.2f} EUR "
-                f"(ref: {best['reference'][:80]}…)."
+                f"Bank statement {mt_best['file']} on {mt_best['date']} shows {abs(_safe_float(mt_best['amount'])):,.2f} EUR "
+                f"(ref: {mt_best['reference'][:80]}…)."
             )
+
+        # Build mailto (button)
+        mailto = self._build_bank_mailto(io, gl_best, mt_best)
 
         summary_text = " ".join(parts)
         invoice_pdf = self._find_invoice_pdf(inv)
@@ -549,4 +608,5 @@ class FinanceAuditAgent:
             "table_rows_erp": table_erp,
             "table_rows_bank": bank_rows,
             "Invoice_PDF": invoice_pdf,
+            "bankdesk_mailto": mailto,  # <<< use this in the UI for the button
         }
