@@ -45,8 +45,8 @@ class FinanceAuditAgent:
     period_min: int
     period_max: int
     date_window_days: int = 14  # UI simple slider
-    date_window_days_gl: int = 60  # GL payment search window
-    date_window_days_bank: int = 10  # MT940 search window
+    date_window_days_gl: int = 90  # GL payment search window
+    date_window_days_bank: int = 90  # MT940 search window
 
     # runtime
     erp_df: pd.DataFrame | None = None
