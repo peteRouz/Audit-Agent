@@ -1,580 +1,470 @@
+from __future__ import annotations
+
+import math
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Iterable
+from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 
+# ----------------------------- utils ---------------------------------
+def _norm_str(x) -> str:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return ""
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _approx_equal(a: float, b: float, tol: float = 0.02) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except Exception:
+        return False
+
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+# ------------------------ main agent ---------------------------------
+@dataclass
 class FinanceAuditAgent:
-    """
-    Finance Audit Agent
-    Liga ERP (JE) -> (opcional) Faturas PDF -> Banco (MT940).
+    excel_path: Path
+    sheet_name: str
+    bank_dir: Path
+    invoices_dir: Path
+    bank_account_suffix: str
+    allowed_tt: List[str]
+    period_min: int
+    period_max: int
+    date_window_days: int = 14  # UI simple slider
+    date_window_days_gl: int = 60  # GL payment search window
+    date_window_days_bank: int = 10  # MT940 search window
 
-    Principais:
-      - explain_trans(trans_no)
-      - explain_from_io(io_trans_no): IO -> (GL/PB) -> Banco + PDF
-    """
+    # runtime
+    erp_df: pd.DataFrame | None = None
+    mt940_index: List[Dict] | None = None
 
-    def __init__(
-        self,
-        excel_path: Path,
-        sheet_name: str = "VT - JE Template (JPF)",
-        bank_dir: Path = Path("."),
-        invoices_dir: Path = Path("."),
-        bank_account_suffix: str = "1478",
-        allowed_tt: Optional[List[str]] = None,
-        period_min: int = 202501,
-        period_max: int = 202512,
-        date_window_days: int = 14,
-    ) -> None:
-        self.excel_path = Path(excel_path)
-        self.sheet_name = sheet_name
-        self.bank_dir = Path(bank_dir)
-        self.invoices_dir = Path(invoices_dir)
-        self.bank_account_suffix = bank_account_suffix
-        self.allowed_tt = set(allowed_tt or ["IO", "PB", "GL"])
-        self.period_min = int(period_min)
-        self.period_max = int(period_max)
-        self.date_window_days = int(date_window_days)
+    def __post_init__(self):
+        self._load_erp()
+        self._index_mt940()
 
-        # Índices carregados
-        self.je_index = self._load_je_index()    # agregado por trans_no (para acesso rápido)
-        self.bank_df = self._load_bank_entries() # movimentos MT940 parseados
-        self.bank_by_amount = (
-            self.bank_df.groupby("abs_amount_r2") if not self.bank_df.empty else None
-        )
-        self._mt940_cache: Optional[List[dict]] = None  # cache parser MT940
+    # -------------------- Loaders / Indexers --------------------------
+    def _load_erp(self):
+        # Read Excel with robust engine selection
+        try:
+            df = pd.read_excel(self.excel_path, sheet_name=self.sheet_name, engine="openpyxl")
+        except ImportError:
+            raise ImportError("Missing dependency 'openpyxl'. Please add 'openpyxl' to requirements.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read ERP Excel: {e}")
 
-    # ---------------------------------------------------------------------
-    # Loader do ERP
-    # ---------------------------------------------------------------------
-    def _load_je_index(self) -> pd.DataFrame:
-        df = pd.read_excel(self.excel_path, sheet_name=self.sheet_name)
+        # Normalize expected columns (keep original headers as in your file)
+        expected = [
+            "Entity", "T", "TransNo", "Trans dat", "Perioc",
+            "Hdl.acc", "Acc(T)", "Acc(I)",
+            "Cat1", "Cat2", "Cat3", "Cat4", "Cat5",
+            "Ca", "CaV",
+            "Ap/Ar I", "Ap/Ar ID(T)",
+            "Inv N",
+            "Cur", "Cur. amount", "Amount"
+        ]
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            # don't hard fail; warn in downstream errors
+            pass
 
-        # Supplier e conta contábil (cabecalhos possíveis)
-        supplier_candidates = ["Ap/Ar ID(T)", "Ap/Ar ID", "Supplier", "Supplier name", "Name"]
-        supplier_col = next((c for c in supplier_candidates if c in df.columns), None)
+        # Ensure numeric types
+        for col in ["Perioc", "Cur. amount", "Amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Conta contábil (o teu ficheiro mostra "Hd.a")
-        account_candidates = ["Hd.a", "Account", "GL account", "G/L Account"]
-        account_col = next((c for c in account_candidates if c in df.columns), None)
+        if "Trans dat" in df.columns:
+            df["Trans dat"] = pd.to_datetime(df["Trans dat"], errors="coerce")
 
-        cols_map = {
-            "Entity": "entity",
-            "TT": "tt",
-            "TransNo": "trans_no",
-            "Trans date": "trans_date",
-            "Period": "period",
-            "Inv No": "invoice_no",
-            "Cur": "currency",
-            "Cur. amount": "amount_cur",
-            "Amount": "amount_eur",
-            "Text": "text",
-        }
-        if supplier_col:
-            cols_map[supplier_col] = "supplier"
-        if account_col:
-            cols_map[account_col] = "gl_account"
+        # Filter by allowed TTs and period range
+        if "T" in df.columns:
+            df["T"] = df["T"].astype(str).str.upper()
 
-        # cria colunas em falta para não rebentar
-        for k in cols_map.keys():
-            if k not in df.columns:
-                df[k] = None
+        allowed = set(x.upper() for x in (self.allowed_tt or []))
+        if allowed:
+            df = df[df["T"].isin(allowed) | df["T"].eq("IO")]  # always keep IO
 
-        df = df[list(cols_map.keys())].rename(columns=cols_map)
+        if "Perioc" in df.columns:
+            df = df[(df["Perioc"] >= int(self.period_min)) & (df["Perioc"] <= int(self.period_max))]
 
-        # Normalizações
-        df["period"] = pd.to_numeric(df["period"], errors="coerce")
-        df = df[(df["period"] >= self.period_min) & (df["period"] <= self.period_max)]
-        df["trans_date"] = pd.to_datetime(df["trans_date"], errors="coerce").dt.date
-        if "supplier" not in df.columns:
-            df["supplier"] = None
-        if "gl_account" not in df.columns:
-            df["gl_account"] = None
+        self.erp_df = df.reset_index(drop=True)
 
-        # Guarda CÓPIA CRUA (linha a linha) para análises
-        self.je_lines = df.copy()
+    def _index_mt940(self):
+        """Parse MT940-like files (.sta / .mt940 / .txt). Very simple parser."""
+        self.mt940_index = []
+        if not self.bank_dir or not Path(self.bank_dir).exists():
+            return
 
-        # Índice agregado apenas para TT permitidos
-        df_idx = df[df["tt"].isin(self.allowed_tt)].copy()
-        agg = {
-            "entity": "first",
-            "tt": lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0],
-            "trans_date": "min",
-            "period": "first",
-            "invoice_no": lambda s: s.dropna().astype(str).iloc[0] if s.notna().any() else None,
-            "currency": lambda s: s.dropna().iloc[0] if s.notna().any() else None,
-            "amount_eur": lambda s: s.abs().max(),  # melhor proxy para IO multi-linha
-            "text": lambda s: s.dropna().iloc[0] if s.notna().any() else None,
-            "supplier": lambda s: s.dropna().iloc[0] if s.notna().any() else None,
-            "gl_account": lambda s: s.dropna().astype(str).iloc[0] if s.notna().any() else None,
-        }
-        je_index = df_idx.groupby("trans_no", as_index=False).agg(agg).sort_values("trans_no")
-        return je_index
+        suffix = str(self.bank_account_suffix or "").strip()
+        files = []
+        for ext in ("*.sta", "*.mt940", "*.txt"):
+            files += list(Path(self.bank_dir).glob(ext))
 
-    # ---------------------------------------------------------------------
-    # Parser & loader de MT940
-    # ---------------------------------------------------------------------
-    @staticmethod
-    def _parse_mt940_file(path: Path) -> list:
-        """Parser simples :61: e :86:"""
-        entries: List[dict] = []
-        account: Optional[str] = None
-        current: Optional[dict] = None
-
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-
-        def flush():
-            nonlocal current
-            if current is not None:
-                if current.get("description"):
-                    current["description"] = re.sub(r"\s+", " ", current["description"]).strip()
-                entries.append(current)
-                current = None
-
-        for raw in lines:
-            line = raw.rstrip("\n")
-            if line.startswith(":25:"):
-                account = line[4:].strip()
-            elif line.startswith(":61:"):
-                flush()
-                body = line[4:].strip()
-                m_date = re.match(r"(\d{6})", body)
-                date_obj = None
-                if m_date:
-                    yy, mm, dd = int(body[0:2]), int(body[2:4]), int(body[4:6])
-                    year = 2000 + yy if yy < 50 else 1900 + yy
-                    try:
-                        date_obj = datetime(year, mm, dd).date()
-                    except ValueError:
-                        date_obj = None
-                m_dc = re.search(r"[DC]", body)
-                dc = m_dc.group(0) if m_dc else None
-                m_amt = re.search(r"([0-9]+,[0-9]{2})", body)
-                amount = None
-                if m_amt:
-                    amt_str = m_amt.group(1).replace(".", "").replace(",", ".")
-                    amount = float(amt_str)
-                    if dc == "D":
-                        amount = -amount
-                current = {
-                    "account": account,
-                    "date": date_obj,
-                    "amount": amount,
-                    "dc": dc,
-                    "description": "",
-                    "file": path.name,
-                }
-            elif line.startswith(":86:"):
-                if current is None:
-                    continue
-                desc = line[4:].strip()
-                current["description"] = (current.get("description", "") + " " + desc).strip()
-            else:
-                if current is not None and line.strip():
-                    current["description"] += " " + line.strip()
-        flush()
-        return entries
-
-    def _load_bank_entries(self) -> pd.DataFrame:
-        files = [p for p in self.bank_dir.glob("**/*") if p.suffix.lower() in [".sta", ".mt940", ".txt"]]
-        all_entries: List[dict] = []
-        for p in files:
+        for f in files:
             try:
-                all_entries.extend(self._parse_mt940_file(p))
-            except Exception as e:
-                print(f"[WARN] Falha a parsear {p.name}: {e}")
-
-        dfb = pd.DataFrame(all_entries)
-        if dfb.empty:
-            return dfb
-
-        # filtro por sufixo da conta
-        def ends_with_suffix(acc: Any, suffix: str) -> bool:
-            if not isinstance(acc, str):
-                acc = str(acc)
-            m = re.search(r"(\d{4})(?!.*\d)", acc or "")
-            if m:
-                return m.group(1) == suffix
-            return acc.replace(" ", "").endswith(suffix)
-
-        if self.bank_account_suffix:
-            dfb = dfb[dfb["account"].apply(lambda a: ends_with_suffix(a, self.bank_account_suffix))]
-
-        dfb["abs_amount_r2"] = dfb["amount"].abs().round(2)
-        dfb["date"] = pd.to_datetime(dfb["date"], errors="coerce").dt.date
-        return dfb
-
-    # ---------------------------------------------------------------------
-    # Utilitários & invoices
-    # ---------------------------------------------------------------------
-    @staticmethod
-    def _supplier_hint_from_text(text: str) -> str:
-        if not isinstance(text, str):
-            return ""
-        tokens = re.findall(r"[A-Za-z]{4,}", text)
-        return tokens[0] if tokens else ""
-
-    def _find_invoice_pdf(self, invoice_no: Optional[str]) -> Optional[str]:
-        inv = (invoice_no or "").strip()
-        if not inv:
-            return None
-        path = self.invoices_dir / f"{inv}.pdf"
-        return str(path) if path.exists() else None
-
-    # ---------------------------------------------------------------------
-    # IO → GL/PB (ERP)
-    # ---------------------------------------------------------------------
-    def _find_payment_for_io(
-        self,
-        io_row: pd.Series,
-        max_days: int = 60,
-        tt_ok: Iterable[str] = ("GL", "PB"),
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Matching do pagamento no ERP a partir de LINHAS CRUAS:
-          - filtra TT (GL/PB) na janela de datas
-          - filtro por invoice/supplier quando possível
-          - agrega por trans_no e aceita se:
-              sum_match ≈ IO  OU  max_abs ≈ IO
-        """
-        io_amt = float(io_row["amount_eur"])
-        io_date = pd.to_datetime(io_row["trans_date"]).date() if pd.notna(io_row["trans_date"]) else None
-        io_inv = str(io_row.get("invoice_no") or "").strip()
-        io_sup = (str(io_row.get("supplier") or "").strip()).lower()
-        if io_date is None:
-            return None
-
-        lines = self.je_lines.copy()
-        lines["trans_date"] = pd.to_datetime(lines["trans_date"], errors="coerce").dt.date
-        lines["invoice_norm"] = lines["invoice_no"].fillna("").astype(str).str.strip()
-        lines["supplier_norm"] = lines.get("supplier", pd.Series([None]*len(lines))).fillna("").astype(str).str.lower().str.strip()
-
-        dt_min = io_date - timedelta(days=max_days)
-        dt_max = io_date + timedelta(days=max_days)
-        pay = lines[(lines["tt"].isin(set(tt_ok))) & (lines["trans_date"].between(dt_min, dt_max))].copy()
-        if pay.empty:
-            return None
-
-        by_ref = pay[
-            ((pay["invoice_norm"] == io_inv) & (io_inv != "")) |
-            ((pay["supplier_norm"] == io_sup) & (io_sup != ""))
-        ].copy()
-
-        def _agg(df_):
-            return pd.Series({
-                "trans_date": df_["trans_date"].min(),
-                "sum_match": df_["amount_eur"].sum(),
-                "max_abs": df_["amount_eur"].abs().max(),
-                "tt": df_["tt"].iloc[0],
-            })
-
-        grouped = (by_ref if not by_ref.empty else pay).groupby("trans_no").apply(_agg).reset_index()
-        is_ok = (
-            np.isclose(grouped["sum_match"].abs(), abs(io_amt), atol=0.1) |
-            np.isclose(grouped["max_abs"].abs(), abs(io_amt), atol=0.1)
-        )
-        grouped = grouped[is_ok]
-        if grouped.empty:
-            return None
-
-        grouped["date_delta"] = (pd.to_datetime(grouped["trans_date"]) - pd.to_datetime(io_date)).abs()
-        best = grouped.sort_values("date_delta").iloc[0].to_dict()
-
-        return {
-            "trans_no": int(best["trans_no"]),
-            "trans_date": pd.to_datetime(best["trans_date"]).date().isoformat(),
-            "amount_eur": float(best["sum_match"]) if np.isclose(abs(best["sum_match"]), abs(io_amt), atol=0.1) else float(best["max_abs"]),
-            "tt": best["tt"],
-            "invoice_no": io_inv or None,
-            "supplier": io_row.get("supplier"),
-        }
-
-    # ---------------------------------------------------------------------
-    # Banco (MT940)
-    # ---------------------------------------------------------------------
-    def _parse_mt940_dir(self) -> List[dict]:
-        if self._mt940_cache is not None:
-            return self._mt940_cache
-        entries: List[dict] = []
-        for f in sorted(self.bank_dir.glob("*")):
-            if f.suffix.lower() not in {".sta", ".mt940", ".txt"}:
-                continue
-            try:
-                entries.extend(self._parse_mt940_file(f))
-            except Exception as e:
-                print(f"[WARN] Falha a parsear {f.name}: {e}")
-        for e in entries:
-            if isinstance(e.get("date"), datetime):
-                e["date"] = e["date"].date().isoformat()
-            elif hasattr(e.get("date"), "isoformat"):
-                e["date"] = e["date"].isoformat()
-            else:
-                e["date"] = str(e.get("date")) if e.get("date") else None
-        self._mt940_cache = entries
-        return entries
-
-    def _find_payment_in_mt940(
-        self,
-        io_row: pd.Series,
-        gl_row: Optional[Dict[str, Any]] = None,
-        max_days: int = 10,
-    ) -> Optional[Dict[str, Any]]:
-        io_amt = float(io_row["amount_eur"])
-        io_inv = str(io_row.get("invoice_no") or "").strip()
-        io_sup = (str(io_row.get("supplier") or "").strip()).lower()
-
-        ref_date = None
-        if gl_row and gl_row.get("trans_date"):
-            ref_date = datetime.fromisoformat(gl_row["trans_date"]).date()
-        else:
-            ref_date = pd.to_datetime(io_row["trans_date"]).date() if pd.notna(io_row["trans_date"]) else None
-        if ref_date is None:
-            return None
-
-        entries = self._parse_mt940_dir()
-        dt_min = ref_date - timedelta(days=max_days)
-        dt_max = ref_date + timedelta(days=max_days)
-
-        best = None
-        best_score = -1
-        for e in entries:
-            try:
-                d = datetime.fromisoformat(e["date"]).date()
+                text = f.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
-            if not (dt_min <= d <= dt_max):
+
+            # split on transactions using :61:
+            chunks = re.split(r"(?=:61:)", text)
+            for ch in chunks:
+                if not ch.strip():
+                    continue
+                # extract :61: (date/amount) and :86: (ref/desc)
+                m61 = re.search(r":61:(.*)", ch)
+                m86 = re.search(r":86:(.*)", ch, re.DOTALL)
+
+                raw61 = m61.group(1).strip() if m61 else ""
+                raw86 = m86.group(1).strip().replace("\n", " ") if m86 else ""
+
+                # very rough date (YYMMDD at start of :61:)
+                tx_date = None
+                mdate = re.match(r"(\d{6})", raw61)
+                if mdate:
+                    yymmdd = mdate.group(1)
+                    yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:])
+                    year = 2000 + yy if yy < 80 else 1900 + yy
+                    try:
+                        tx_date = datetime(year, mm, dd).date()
+                    except Exception:
+                        pass
+
+                # amount: look for C/D then amount with comma/decimal
+                amt = None
+                mam = re.search(r"[CD]([\d,\.]+)", raw61)
+                if mam:
+                    s = mam.group(1).replace(",", ".")
+                    try:
+                        amt = float(s)
+                    except Exception:
+                        pass
+
+                # IBAN/account from :86: if present
+                acc = None
+                miban = re.search(r"[A-Z]{2}\d{2}[A-Z0-9]{10,}", raw86)
+                if miban:
+                    acc = miban.group(0)
+                elif self.bank_account_suffix and self.bank_account_suffix in raw86:
+                    acc = f"...{self.bank_account_suffix}"
+
+                self.mt940_index.append({
+                    "file": str(f.name),
+                    "date": tx_date,
+                    "amount": amt,
+                    "ref": raw86[:500],
+                    "account": acc
+                })
+
+    # ------------------------ Public helpers ---------------------------
+    def index_summary(self) -> Dict:
+        if self.erp_df is None:
+            return {}
+        counts = self.erp_df["T"].value_counts(dropna=False).to_dict()
+        return {
+            "rows": int(len(self.erp_df)),
+            "by_T": counts,
+            "period_range": [int(self.period_min), int(self.period_max)],
+        }
+
+    # ---------------------- IO utilities -------------------------------
+    def _get_io_row(self, io_trans_no: int) -> pd.Series:
+        df = self.erp_df
+        df_io = df[df["T"].astype(str).str.upper().eq("IO")]
+        row = df_io[df_io["TransNo"].astype(str).eq(str(io_trans_no))]
+        if row.empty:
+            raise ValueError(f"IO {io_trans_no} not found.")
+        return row.iloc[0]
+
+    def _get_io_block(self, io_trans_no: int) -> pd.DataFrame:
+        df = self.erp_df
+        return df[(df["T"].astype(str).str.upper() == "IO") &
+                  (df["TransNo"].astype(str) == str(io_trans_no))].copy()
+
+    def _get_ap_account_from_io(self, io_trans_no: int) -> Dict[str, Optional[str]]:
+        """Find trade payables account on the IO (prefer description 'trade payables', else largest credit)."""
+        block = self._get_io_block(io_trans_no)
+        if block.empty:
+            return {"code": None, "desc": None}
+
+        # 1) prefer description contains 'trade payables'
+        cand = block[_norm_str(block["Acc(I)"]).str.contains("trade payables", na=False)]
+        if cand.empty:
+            # 2) largest credit by EUR amount (negative)
+            cand = block.sort_values("Amount").head(1)
+
+        r = cand.iloc[0]
+        code = str(r.get("Acc(T)", "")).strip() or None
+        desc = str(r.get("Acc(I)", "")).strip() or None
+        return {"code": code, "desc": desc}
+
+    # ---------------------- GL-only matching ---------------------------
+    def _find_gl_payment(self, io_row: pd.Series, ap_account: Dict) -> Optional[Dict]:
+        df = self.erp_df.copy()
+
+        # Date window around IO date
+        io_date = pd.to_datetime(io_row["Trans dat"]).normalize()
+        date_min = io_date - pd.Timedelta(days=self.date_window_days_gl)
+        date_max = io_date + pd.Timedelta(days=self.date_window_days_gl)
+
+        # Filter GL only and in window
+        df = df[df["T"].astype(str).str.upper().eq("GL")]
+        df["Trans dat"] = pd.to_datetime(df["Trans dat"], errors="coerce")
+        df = df[(df["Trans dat"] >= date_min) & (df["Trans dat"] <= date_max)]
+
+        # Supplier match by ID and/or name
+        io_sup_id = _norm_str(io_row.get("Ap/Ar I", ""))
+        io_sup_nm = _norm_str(io_row.get("Ap/Ar ID(T)", ""))
+
+        df["_sup_id"] = df["Ap/Ar I"].apply(_norm_str)
+        df["_sup_nm"] = df["Ap/Ar ID(T)"].apply(_norm_str)
+        df = df[(df["_sup_id"] == io_sup_id) | (df["_sup_nm"] == io_sup_nm)]
+
+        if df.empty:
+            return None
+
+        io_amt_eur = abs(_safe_float(io_row.get("Amount", 0.0)))
+        io_amt_cur = abs(_safe_float(io_row.get("Cur. amount", 0.0)))
+        ap_code = (ap_account.get("code") or "").strip()
+        ap_desc_norm = _norm_str(ap_account.get("desc") or "")
+
+        groups = []
+        for gl_no, g in df.groupby("TransNo"):
+            g = g.copy()
+
+            # identify AP debit lines (same account as IO) in EUR > 0
+            is_code = g["Acc(T)"].astype(str).str.strip().eq(ap_code) if ap_code else False
+            is_desc = _norm_str(g["Acc(I)"]).str.contains(re.escape(ap_desc_norm), na=False) if ap_desc_norm else False
+            ap_mask = is_code | is_desc
+
+            g_ap = g[ap_mask & (g["Amount"] > 0)]
+            ap_debit_eur = _safe_float(g_ap["Amount"].sum())
+            ap_debit_cur = _safe_float(g_ap["Cur. amount"].sum())
+
+            # bank/clearing heuristic
+            bank_like = _norm_str(g["Acc(I)"]).str.contains("bank|iban|clearing|ing|santander|hsbc|unicredit", na=False)
+
+            # score
+            score = 0.0
+            if _approx_equal(ap_debit_eur, io_amt_eur, 0.05):
+                score += 3.5
+            if _approx_equal(abs(ap_debit_cur), io_amt_cur, 0.05):
+                score += 2.0
+            if bank_like.any():
+                score += 1.0
+
+            gl_date = pd.to_datetime(g.iloc[0]["Trans dat"]).normalize()
+            days = abs((gl_date - io_date).days)
+            score += max(0, 1.0 - (days / 90.0))  # up to +1
+
+            groups.append({
+                "gl_trans_no": gl_no,
+                "score": score,
+                "gl_date": gl_date.date(),
+                "ap_debit_eur": ap_debit_eur,
+                "ap_debit_cur": ap_debit_cur,
+                "rows": g,
+                "has_bank_line": bool(bank_like.any()),
+            })
+
+        if not groups:
+            return None
+
+        best = max(groups, key=lambda x: x["score"])
+        if best["ap_debit_eur"] <= 0 and best["ap_debit_cur"] == 0:
+            return None
+        return best
+
+    # -------------------- MT940 matching (simple) ----------------------
+    def _match_mt940(self, gl_best: Optional[Dict], io_row: pd.Series) -> List[Dict]:
+        """Match bank entries by amount/date window ±N and presence of supplier/invoice ref."""
+        if not self.mt940_index:
+            return []
+
+        # prefer GL date, fallback to IO date
+        base_date = gl_best["gl_date"] if gl_best else pd.to_datetime(io_row["Trans dat"]).date()
+        w = int(self.date_window_days_bank or 10)
+        dmin = base_date - timedelta(days=w)
+        dmax = base_date + timedelta(days=w)
+
+        # target amount in EUR (from IO or GL AP debit)
+        target_amt = abs(_safe_float(io_row.get("Amount", 0.0)))
+        if gl_best and _safe_float(gl_best.get("ap_debit_eur", 0.0)) > 0:
+            target_amt = abs(_safe_float(gl_best.get("ap_debit_eur", 0.0)))
+
+        inv = _norm_str(io_row.get("Inv N", ""))
+        sup = _norm_str(io_row.get("Ap/Ar ID(T)", ""))
+
+        candidates = []
+        for row in self.mt940_index:
+            dt = row.get("date")
+            if not dt or not (dmin <= dt <= dmax):
                 continue
+            amt = abs(_safe_float(row.get("amount", 0.0)))
 
-            score = 0
-            if np.isclose(abs(e.get("amount", 0.0)), abs(io_amt), atol=0.05):
-                score += 2
-            text = (e.get("description") or "").lower()
-            if io_inv and io_inv.lower() in text:
-                score += 3
-            sup_key = io_sup.replace(" ", "")
-            if io_sup and (io_sup[:14] in text or sup_key[:14] in text.replace(" ", "")):
-                score += 1
+            # score
+            score = 0.0
+            if _approx_equal(amt, target_amt, 0.05):
+                score += 3.5
+            ref = _norm_str(row.get("ref", ""))
+            if inv and inv in ref:
+                score += 1.0
+            if sup and any(w in ref for w in sup.split()):
+                score += 0.5
+            if self.bank_account_suffix and str(self.bank_account_suffix) in (row.get("account") or ""):
+                score += 0.5
 
-            if score > best_score:
-                best, best_score = e, score
+            candidates.append({
+                "date": row.get("date"),
+                "amount": row.get("amount"),
+                "reference": row.get("ref"),
+                "account": row.get("account"),
+                "file": row.get("file"),
+                "score": score
+            })
 
-        if best and best_score >= 2:
-            return {
-                "date": best["date"],
-                "amount": best.get("amount"),
-                "reference": (best.get("description") or "")[:150],
-                "mt940_file": best.get("file"),
-                "account": best.get("account"),
-            }
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:3]  # top 3
+
+    # --------------------- Invoice PDF helper --------------------------
+    def _find_invoice_pdf(self, invoice_no: str | int) -> Optional[str]:
+        if not invoice_no:
+            return None
+        inv = str(invoice_no).strip()
+        p = Path(self.invoices_dir or ".")
+        for name in (f"{inv}.pdf", f"INV_{inv}.pdf", f"Invoice_{inv}.pdf"):
+            f = p / name
+            if f.exists():
+                return str(f)
         return None
 
-    # ---------------------------------------------------------------------
-    # Públicos
-    # ---------------------------------------------------------------------
-    def _io_lines_details(self, io_trans_no: int) -> Dict[str, Any]:
-        """Extrai detalhes ricos da IO a partir das linhas cruas (contas, descrições, moeda/valor, IVA RC)."""
-        rows = self.je_lines[(self.je_lines["trans_no"] == io_trans_no) & (self.je_lines["tt"] == "IO")].copy()
-        if rows.empty:
-            return {}
+    # --------------------------- Main API ------------------------------
+    def explain_from_io(self, io_trans_no: int) -> Dict:
+        io = self._get_io_row(io_trans_no)
+        io_block = self._get_io_block(io_trans_no)
 
-        # principais campos
-        supplier = rows["supplier"].dropna().astype(str).iloc[0] if rows["supplier"].notna().any() else None
-        currency = rows["currency"].dropna().astype(str).iloc[0] if rows["currency"].notna().any() else None
+        # Values
+        sup = str(io.get("Ap/Ar ID(T)", "")).strip()
+        inv = str(io.get("Inv N", "")).strip()
+        cur = str(io.get("Cur", "")).strip()
+        amt_cur = abs(_safe_float(io.get("Cur. amount", 0.0)))
+        amt_eur = abs(_safe_float(io.get("Amount", 0.0)))
+        post_date = pd.to_datetime(io.get("Trans dat")).date()
 
-        # linha de débito principal (maior valor positivo)
-        rows["amount_eur_num"] = pd.to_numeric(rows["amount_eur"], errors="coerce")
-        debit_rows = rows[rows["amount_eur_num"] > 0].copy()
-        credit_rows = rows[rows["amount_eur_num"] < 0].copy()
-
-        main_debit = None
-        if not debit_rows.empty:
-            main_debit = debit_rows.sort_values("amount_eur_num", ascending=False).iloc[0]
-        vat_flag = rows["text"].fillna("").str.lower().str.contains("vat").any() or \
-                   rows["text"].fillna("").str.lower().str.contains("reverse").any()
-
-        payables_credit = None
-        if not credit_rows.empty:
-            # tenta apanhar a linha de "Trade payables", senão pega a maior em valor absoluto
-            cand = credit_rows.copy()
-            mask_tp = cand["text"].fillna("").str.lower().str.contains("payable")
-            if mask_tp.any():
-                payables_credit = cand[mask_tp].sort_values("amount_eur_num").iloc[0]
-            else:
-                payables_credit = cand.sort_values("amount_eur_num").iloc[0]
-
-        return {
-            "supplier": supplier,
-            "currency": currency,
-            "main_debit_account": str(main_debit["gl_account"]) if main_debit is not None else None,
-            "main_debit_desc": str(main_debit["text"]) if main_debit is not None else None,
-            "main_debit_amount_cur": float(main_debit["amount_cur"]) if (main_debit is not None and pd.notna(main_debit["amount_cur"])) else None,
-            "main_debit_amount_eur": float(main_debit["amount_eur"]) if (main_debit is not None and pd.notna(main_debit["amount_eur"])) else None,
-            "vat_reverse_charge": bool(vat_flag),
-            "payables_credit_amount_eur": float(payables_credit["amount_eur"]) if payables_credit is not None else None,
-        }
-
-    def explain_trans(self, trans_no: int) -> Dict[str, Any]:
-        """Mantido (modo simples)."""
-        recs = self.je_index[self.je_index["trans_no"] == trans_no]
-        if recs.empty:
-            return {"error": f"TransNo {trans_no} não encontrado (ou fora de TT {sorted(self.allowed_tt)})."}
-        row = recs.iloc[0]
-
-        amount = float(row["amount_eur"]) if pd.notna(row["amount_eur"]) else None
-        je_date = row["trans_date"]
-        invoice_no = str(row["invoice_no"]).strip() if pd.notna(row["invoice_no"]) else ""
-        text = row["text"] or ""
-        supplier = row.get("supplier")
-
-        response: Dict[str, Any] = {
-            "JE": {
-                "trans_no": int(row["trans_no"]),
-                "entity": row["entity"],
-                "tt": row["tt"],
-                "trans_date": je_date.isoformat() if je_date else None,
-                "period": int(row["period"]) if pd.notna(row["period"]) else None,
-                "invoice_no": invoice_no or None,
-                "currency": row["currency"],
-                "amount_eur": amount,
-                "text": text,
-                "supplier": supplier,
-            },
-            "Invoice": None,
-            "Payment": None,
-            "Sources": {"erp_excel": self.excel_path.name, "mt940_files": []},
-            "Status": "FALTA_PAGAMENTO",
-        }
-
-        pdf = self._find_invoice_pdf(invoice_no if invoice_no else None)
-        if pdf:
-            response["Invoice"] = {"file": Path(pdf).name}
-        return response
-
-    def explain_from_io(self, io_trans_no: int) -> Dict[str, Any]:
-        """
-        IO -> (GL/PB) -> Banco (MT940) + PDF + resumo audit-ready
-        """
-        io_recs = self.je_index[(self.je_index["trans_no"] == io_trans_no) & (self.je_index["tt"] == "IO")]
-        if io_recs.empty:
-            return {"error": f"TransNo {io_trans_no} não é IO ou não existe."}
-        io = io_recs.iloc[0]
-
-        io_payload = {
-            "trans_no": int(io["trans_no"]),
-            "trans_date": pd.to_datetime(io["trans_date"]).date().isoformat() if pd.notna(io["trans_date"]) else None,
-            "invoice_no": (str(io.get("invoice_no") or "").strip() or None),
-            "amount_eur": float(io["amount_eur"]),
-            "text": str(io.get("text") or "").strip() or None,
-            "supplier": str(io.get("supplier") or "").strip() or None,
-        }
-
-        # Detalhes ricos da IO (contas/descrição/moeda/IVA)
-        io_details = self._io_lines_details(io_trans_no)
-
-        # ERP pagamento
-        glpb = self._find_payment_for_io(io, max_days=60, tt_ok=("GL", "PB"))
-        # Banco
-        bank = self._find_payment_in_mt940(io, glpb, max_days=10)
-        # PDF
-        pdf = self._find_invoice_pdf(io_payload["invoice_no"])
-
-        status = "OK" if (glpb and bank) else ("PARCIAL" if (glpb or bank) else "FALTA_PAGAMENTO")
-
-        # Narrativa audit-ready
-        parts = []
-        sup_txt = io_details.get("supplier") or io_payload.get("supplier") or "(s/ fornecedor)"
-        parts.append(
-            f"A fatura {io_payload.get('invoice_no') or '(s/ nº)'} do fornecedor {sup_txt} "
-            f"no montante de {io_payload['amount_eur']:.2f} EUR foi registada a {io_payload['trans_date']}."
-        )
-
-        # adicionar breakdown de IO
-        md_acc = io_details.get("main_debit_account")
-        md_desc = io_details.get("main_debit_desc")
-        md_cur_val = io_details.get("main_debit_amount_cur")
-        currency = io_details.get("currency") or ""
-        if md_acc or md_desc or md_cur_val:
-            seg = "A IO debita"
-            if md_acc:
-                seg += f" a conta {md_acc}"
-            if md_desc:
-                seg += f" ({md_desc})"
-            if md_cur_val is not None:
-                seg += f" no valor de {md_cur_val:.2f} {currency}"
-            parts.append(seg + ".")
-        if io_details.get("vat_reverse_charge"):
-            parts.append("O lançamento apresenta IVA (reverse charge) nas linhas de suporte.")
-        if io_details.get("payables_credit_amount_eur") is not None:
-            parts.append("O fornecedor é creditado pelo valor respetivo em 'Trade payables'.")
-
-        # pagamento ERP
-        if glpb:
-            parts.append(
-                f"Pagamento ERP identificado ({glpb['tt']} {glpb['trans_no']}) em {glpb['trans_date']} "
-                f"no montante de {glpb['amount_eur']:.2f} EUR."
-            )
+        # Expense (debit) line from IO
+        io_debits = io_block[io_block["Amount"] > 0]
+        if not io_debits.empty:
+            exp_line = io_debits.iloc[0]
+            exp_acc_code = str(exp_line.get("Acc(T)", "")).strip()
+            exp_acc_desc = str(exp_line.get("Acc(I)", "")).strip()
         else:
-            parts.append("Pagamento ERP não encontrado (GL/PB).")
+            exp_acc_code = ""
+            exp_acc_desc = ""
 
-        # banco
-        if bank:
-            parts.append(
-                f"Confirmação no extrato ({bank.get('mt940_file')}), data {bank.get('date')}, "
-                f"ref «{(bank.get('reference') or '')[:50]}»."
-            )
-        else:
-            parts.append("Movimento correspondente não confirmado no MT940 (±10 dias).")
+        # Trade payables account (credit on IO)
+        ap_acc = self._get_ap_account_from_io(io_trans_no)
+        ap_code = ap_acc.get("code") or ""
+        ap_desc = ap_acc.get("desc") or ""
 
-        # Tabelas separadas (ERP e Banco) + trans_no sem separadores
-        erp_rows = [
-            {"Fonte": "ERP - IO",
-             "trans_no": str(io_payload["trans_no"]),
-             "trans_date": io_payload["trans_date"],
-             "invoice_no": io_payload["invoice_no"],
-             "amount_eur": io_payload["amount_eur"],
-             "supplier": sup_txt}
-        ]
-        if glpb:
-            erp_rows.append({
-                "Fonte": "ERP - Pagamento",
-                "trans_no": str(glpb["trans_no"]),
-                "trans_date": glpb["trans_date"],
-                "invoice_no": glpb.get("invoice_no"),
-                "amount_eur": glpb["amount_eur"],
-                "supplier": sup_txt,
-                "tt": glpb["tt"],
+        # Find GL payment
+        gl_best = self._find_gl_payment(io, ap_acc)
+
+        # Build ERP tables
+        table_erp: List[Dict] = []
+        for _, r in io_block.iterrows():
+            table_erp.append({
+                "source": "ERP - IO",
+                "T": r["T"],
+                "trans_no": str(r["TransNo"]),
+                "date": str(pd.to_datetime(r["Trans dat"]).date()) if pd.notna(r["Trans dat"]) else "",
+                "account": str(r.get("Acc(T)", "")),
+                "account_desc": str(r.get("Acc(I)", "")),
+                "supplier": str(r.get("Ap/Ar ID(T)", "")),
+                "invoice": str(r.get("Inv N", "")),
+                "cur": str(r.get("Cur", "")),
+                "curr_amount": r.get("Cur. amount", ""),
+                "amount_eur": r.get("Amount", ""),
             })
-        bank_rows = [bank] if bank else []
+
+        if gl_best:
+            g = gl_best["rows"]
+            for _, r in g.iterrows():
+                table_erp.append({
+                    "source": "ERP - Payment",
+                    "T": r["T"],
+                    "trans_no": str(r["TransNo"]),
+                    "date": str(pd.to_datetime(r["Trans dat"]).date()) if pd.notna(r["Trans dat"]) else "",
+                    "account": str(r.get("Acc(T)", "")),
+                    "account_desc": str(r.get("Acc(I)", "")),
+                    "supplier": str(r.get("Ap/Ar ID(T)", "")),
+                    "invoice": str(r.get("Inv N", "")),
+                    "cur": str(r.get("Cur", "")),
+                    "curr_amount": r.get("Cur. amount", ""),
+                    "amount_eur": r.get("Amount", ""),
+                })
+
+        # Narrative (English)
+        parts = []
+        parts.append(
+            f"Invoice {inv} from {sup} for {amt_cur:,.2f} {cur} ({amt_eur:,.2f} EUR posted) was recorded on {post_date}."
+        )
+        if exp_acc_code or exp_acc_desc:
+            parts.append(
+                f"The IO debits {exp_acc_code} – {exp_acc_desc} and credits {ap_code} – {ap_desc}."
+            )
+        else:
+            parts.append(f"The IO credits {ap_code} – {ap_desc} (trade payables).")
+
+        status = "OK"
+        if gl_best:
+            parts.append(
+                f"Payment confirmed in GL {gl_best['gl_trans_no']} on {gl_best['gl_date']}: "
+                f"debit {ap_code} – {ap_desc} {abs(gl_best['ap_debit_eur']):,.2f} EUR and credit bank/clearing. "
+            )
+        else:
+            status = "ERP payment (GL) not found"
+            parts.append("No GL transaction found debiting the same trade payables account for the invoice amount.")
+
+        # MT940 matching (optional)
+        bank_rows = []
+        mt_candidates = self._match_mt940(gl_best, io)
+        if mt_candidates:
+            best = mt_candidates[0]
+            bank_rows.append({
+                "date": str(best["date"]),
+                "amount": best["amount"],
+                "reference": best["reference"],
+                "file": best["file"],
+                "account": best.get("account") or f"...{self.bank_account_suffix}",
+                "score": round(best["score"], 2),
+            })
+            parts.append(
+                f"Bank statement {best['file']} on {best['date']} shows {abs(_safe_float(best['amount'])):,.2f} EUR "
+                f"(ref: {best['reference'][:80]}…)."
+            )
+
+        summary_text = " ".join(parts)
+
+        # Invoice PDF
+        invoice_pdf = self._find_invoice_pdf(inv)
 
         return {
-            "summary_text": " ".join(parts),
+            "summary_text": summary_text,
             "Status": status,
-            "IO": io_payload,
-            "IO_details": io_details,
-            "GL_or_PB": glpb,
-            "Payment": bank,
-            "Invoice_PDF": pdf,
-            "Sources": {
-                "erp_excel": str(self.excel_path.name),
-                "mt940_files": sorted([p.name for p in self.bank_dir.glob('*') if p.is_file()]),
-            },
-            "table_rows_erp": erp_rows,
+            "table_rows_erp": table_erp,
             "table_rows_bank": bank_rows,
-        }
-
-    # ---------------------------------------------------------------------
-    # Debug
-    # ---------------------------------------------------------------------
-    def index_summary(self) -> Dict[str, Any]:
-        by_tt = self.je_index["tt"].value_counts().to_dict()
-        return {
-            "rows_total": int(len(self.je_index)),
-            "by_tt": by_tt,
-            "period_min": self.period_min,
-            "period_max": self.period_max,
-            "bank_files": sorted(self.bank_df["file"].unique().tolist()) if not self.bank_df.empty else [],
+            "Invoice_PDF": invoice_pdf,
         }
