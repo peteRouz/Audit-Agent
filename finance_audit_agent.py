@@ -68,7 +68,7 @@ class FinanceAuditAgent:
 
         # Normalize expected columns (keep original headers as in your file)
         expected = [
-            "Entity", "T", "TransNo", "Trans dat", "Perioc",
+            "Entity", "TT", "TransNo", "Trans dat", "Perioc",
             "Hdl.acc", "Acc(T)", "Acc(I)",
             "Cat1", "Cat2", "Cat3", "Cat4", "Cat5",
             "Ca", "CaV",
