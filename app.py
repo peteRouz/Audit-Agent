@@ -1,7 +1,3 @@
-import sys, streamlit as st, numpy
-st.caption(f"Python {sys.version}")
-st.caption(f"Numpy {numpy.__version__}")
-
 import urllib.parse
 from pathlib import Path
 
